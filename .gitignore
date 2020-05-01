@@ -1,0 +1,39 @@
+# OS X
+.DS_Store*
+Icon?
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Linux
+.directory
+*~
+
+
+# npm
+node_modules
+package-lock.json
+*.log
+*.gz
+
+
+# Coveralls
+coverage
+
+# Benchmarking
+benchmarks/graphs
+
+# Data files
+public/data/__pycache__
+public/data/iv
+public/data/*.txt
+public/data/*.json
+
+# Debug/sandbox files
+temp.*
+
+# Old WebStorm files
+.idea/
