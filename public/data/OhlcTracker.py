@@ -21,13 +21,13 @@ import pandas as pd
 from pprint import PrettyPrinter
 pp = PrettyPrinter()
 
-import logging
 # Logger setup
+import logging
 logger = logging.getLogger()
-ch = logging.StreamHandler(stdout)
-formatter = logging.Formatter("%(asctime)s: %(message)s")
-ch.setFormatter(formatter)
 if __name__ == '__main__':
+  ch = logging.StreamHandler(stdout)
+  formatter = logging.Formatter("%(asctime)s: %(message)s")
+  ch.setFormatter(formatter)
   logger.addHandler(ch)
 
 client = BitmexClient(key=None, secret=None)
@@ -75,28 +75,28 @@ DCONDS = {
   },
 }
 
-# Auxiliary function: resample time series
-def resample(series, bin, dbin):
+def resample(df, bin, dbin):
 
-  # Series must be non-empty
-  assert len(series)
+  '''Auxiliary function: resample dataframe (TODO naive).'''
+
+  # Dataframe must be non-empty
+  assert len(df)
 
   # Local function
-  def close_candle(timestamp):
-    result.append({
-      'timestamp': timestamp,
-      'symbol': series[0]['symbol'],
-      'open': open,
-      'high': high,
-      'low': low,
-      'close': close,
-      'volume': volume,
-    })
+  close_candle = lambda timestamp: {
+    'timestamp': timestamp,
+    'symbol': df['symbol'][0],
+    'open': open,
+    'high': high,
+    'low': low,
+    'close': close,
+    'volume': volume,
+  }
 
   # Initial values
-  result = []
+  result = pd.DataFrame()
   is_opening = True
-  for candle in series:
+  for timestamp, candle in df.iterrows():
 
     # Update candle
     if is_opening:
@@ -110,28 +110,26 @@ def resample(series, bin, dbin):
     close = candle['close']
     volume += candle['volume']
 
-    # Candle completed
-    if DCONDS[bin][dbin](candle['timestamp']):
-      close_candle(candle['timestamp'])
+    # Close candle
+    if DCONDS[bin][dbin](timestamp):
+      row = pd.DataFrame(close_candle(timestamp), index=[0]).set_index('timestamp')
+      result = result.append(row)
       is_opening = True
 
   # Close condition was never met
-  if len(result) == 0:
-    close_candle(first_timestamp(bin, dbin, series[0]['timestamp'])[0])
-    return [], result[0]
+  if result.empty:
+    return result, close_candle(first_timestamp(bin, dbin, df.index[0])[0])
 
-  #
-  last_timestamp = result[-1]['timestamp']
+  # 
   partial_candle = {
-    'timestamp': last_timestamp + TIMEDELTAS[dbin],
-    'symbol': series[0]['symbol'],
+    'timestamp': result.index[-1] + TIMEDELTAS[dbin],
+    'symbol': df['symbol'][0],
     'open': close if is_opening else open,
     'high': close if is_opening else high,
     'low': close if is_opening else low,
     'close': close if is_opening else close,
     'volume': 0 if is_opening else volume,
   }
-
   return result, partial_candle
 
 # Indicators
@@ -171,8 +169,8 @@ OFFSETS = {
   '1d': 1,
 }
 
-# Find the first valid timestamp of a derived bin
 def first_timestamp(bin, dbin, t):
+  '''Find the first valid timestamp of a derived bin.'''
   n = 0
   while not DCONDS[bin][dbin](t):
     n += 1
@@ -182,32 +180,38 @@ def first_timestamp(bin, dbin, t):
 # REST function: get candles
 get = lambda bin: parseTimestamps(s.get(f'{DATA_SERVER}?timeframe={bin}').json())
 
-# REST function: add candle
 def add(candle, bin):
+  '''REST function: add candle.'''
   candle = dict(candle) # makes (local) copy
   candle['timeframe'] = bin
   if type(candle['timestamp']) != str:
     candle['timestamp'] = iso_str(candle['timestamp'])
   s.post(f'{DATA_SERVER}/add', json=candle)
 
+def add_dataframe(df, bin):
+  '''semi-REST function: add dataframe.'''
+  df = df.reset_index()
+  df['timestamp'] = df['timestamp'].apply(iso_str)
+  for candle in df.to_dict(orient='records'):
+    add(candle, bin)
+
 # Auxiliary function: datetime object to ISO string
 iso_str = lambda dt: dt.isoformat().replace('+00:00', '.000Z')
 
-# Auxiliary function: parse timestamps
 def parseTimestamps(data):
+  '''Auxiliary function: parse timestamps.'''
   for row in data:
     row['timestamp'] = isoparse(row['timestamp'])
   return data
 
-# Tracks historical and partial data
 class OhlcTracker(Observer):
+  '''Tracks historical and partial data.'''
   def __init__(self, derive=True):
     self.logger = logging.getLogger(__name__)
 
     self.derive = derive
-    self.data = {}
     self.dataframes = {}
-    self.partials = {}
+    self.parts = {}
     
     # self.build()
 
@@ -217,15 +221,14 @@ class OhlcTracker(Observer):
     if self.derive:
       self.build_deriv(repeat)
 
-  # Fetch historical data, insert diff into database, write partials to file
   def build_orig(self, repeat=False):
+    '''Fetch historical data, insert diff into database, write partials to file.'''
     for bin in BINS:
       
       # Fetch previous data, init dataframe, starting point implied
       if not repeat:
-        self.data[bin] = get(bin)
-        self.dataframes[bin] = pd.DataFrame(self.data[bin]).set_index('timestamp')
-      start = len(self.data[bin])
+        self.build_dataframe(bin)
+      start = len(self.dataframes[bin])
       self.logger.info(f'Updating {bin} data (start from {start}).')
 
       # Fetch historical data
@@ -242,11 +245,8 @@ class OhlcTracker(Observer):
 
         # Local work: append to dataframes and data
         df = pd.DataFrame(data).set_index('timestamp')
-        print(df.tail())
-        self.dataframes[bin] = pd.concat([self.dataframes[bin], df],
-                                         sort=False, copy=False)
-        self.data[bin] += data
-        self.logger.debug(f'{bin}: {len(self.data[bin])} (+{len(data)})')
+        self.dataframes[bin] = pd.concat([self.dataframes[bin], df], sort=False)
+        self.logger.debug(f'{bin}: {len(self.dataframes[bin])} (+{len(data)})')
 
         # Local work: database insertion
         self.logger.debug(f'[{time() - t0}] Inserting into database...')
@@ -261,25 +261,24 @@ class OhlcTracker(Observer):
           sleep(dur)
 
       # Fetch partial
-      self.partials[bin] = client.rest.get_buckets(bin, start, partial=True)[0]
-      self.partials[bin]['timestamp'] = isoparse(self.partials[bin]['timestamp'])
+      self.parts[bin] = client.rest.get_buckets(bin, start, partial=True)[0]
+      self.parts[bin]['timestamp'] = isoparse(self.parts[bin]['timestamp'])
 
-  # Derive data
   def build_deriv(self, repeat=False):
+    '''Derive data.'''
     for bin in BINS:
       for dbin in DBINS[bin]:
         if logger.level >= logging.DEBUG: print()
         
         # Get previous data from database, init dataframe
         if not repeat:
-          self.data[dbin] = get(dbin)
-          self.dataframes[dbin] = pd.DataFrame(self.data[dbin]).set_index('timestamp')
+          self.build_dataframe(dbin)
         
         # Determine resample starting point
         row = 0
-        if len(self.data[dbin]):
-          lt = self.data[dbin][-1]['timestamp']
-          ft, n = first_timestamp(bin, dbin, t=self.data[bin][0]['timestamp'])
+        if not self.dataframes[dbin].empty:
+          lt = self.dataframes[dbin].index[-1]
+          ft, n = first_timestamp(bin, dbin, t=self.dataframes[bin].index[0])
           row = n + (lt - ft) / TIMEDELTAS[bin] + OFFSETS[bin]
           assert int(row) == row
           row = int(row)
@@ -288,42 +287,42 @@ class OhlcTracker(Observer):
           self.logger.debug(f'  n   {n}')
           self.logger.debug(f'  lt  {lt}')
           self.logger.debug(f'  row {row}')
-          if row == len(self.data[bin]):
-            self.logger.debug(f'      <no timestamp at row {row}>')
-          elif row > len(self.data[bin]):
-            self.logger.debug(f'      <CRITICAL ERROR: tried to read timestamp at row {row}>')
-          else:
-            self.logger.debug(f"      {self.data[bin][row]['timestamp']}")
-        self.logger.debug(f'Deriving {dbin} (from {row}/{len(self.data[bin])} total {len(self.data[bin])-row} rows)')
+          if row == len(self.dataframes[bin]): self.logger.debug(f'      <no timestamp at row {row}>')
+          elif row > len(self.dataframes[bin]): self.logger.debug(f'      <CRITICAL ERROR: tried to read timestamp at row {row}>')
+          else: self.logger.debug(f"      {self.dataframes[bin].index[row]}")
+        self.logger.debug(f'Deriving {dbin} (from {row}/{len(self.dataframes[bin])} total {len(self.dataframes[bin])-row} rows)')
 
         # Resample bin into dbin
-        if len(self.data[bin][row:]):
-          data, self.partials[dbin] = resample(self.data[bin][row:], bin, dbin)
-          if len(data):
-            df = pd.DataFrame(data).set_index('timestamp')
-            self.dataframes[dbin] = pd.concat([self.dataframes[dbin], df], sort=False)
-          self.data[dbin] += data
+        if row < len(self.dataframes[bin]):
+          data, self.parts[dbin] = resample(self.dataframes[bin].iloc[row:], bin, dbin)
+          self.dataframes[dbin] = pd.concat([self.dataframes[dbin], data], sort=False)
 
-          # Correct with original's partial
-          self.partials[dbin]['high'] = max(self.partials[bin]['high'],
-                                            self.partials[dbin]['high'])
-          self.partials[dbin]['low'] = min(self.partials[bin]['low'],
-                                           self.partials[dbin]['low'])
-          self.partials[dbin]['close'] = self.partials[bin]['close']
-          self.logger.debug(f'adding {str(data)}')
+          # Update derived partial with original's partial
+          self.parts[dbin]['high'] = max(self.parts[bin]['high'],
+                                         self.parts[dbin]['high'])
+          self.parts[dbin]['low'] = min(self.parts[bin]['low'],
+                                        self.parts[dbin]['low'])
+          self.parts[dbin]['close'] = self.parts[bin]['close']
 
           # Insert new candles into database
-          for candle in data:
-            add(candle, dbin)
+          self.logger.debug(f'adding \n{str(data)}')
+          if not data.empty:
+            add_dataframe(data, dbin)
 
         # Case where no resampling is necessary (so no candles to insert either)
         else:
-          self.partials[dbin] = self.partials[bin]
+          self.parts[dbin] = self.parts[bin]
 
-        self.logger.debug(f'{dbin} partial {str(self.partials[dbin])}')
+        self.logger.debug(f'{dbin} partial {str(self.parts[dbin])}')
 
-  # This method is to be called by the socket's message notifier
+  def build_dataframe(self, bin):
+    '''TODO comment.'''
+    self.dataframes[bin] = pd.DataFrame(get(bin))
+    if not self.dataframes[bin].empty:
+      self.dataframes[bin].set_index('timestamp', inplace=True)
+
   def update(self, observable, message):
+    '''This method is to be called by the socket's message notifier.'''
 
     # Update historical data
     if message['table'] == 'tradeBin1h' or message['table'] == 'tradeBin1d':
@@ -334,25 +333,25 @@ class OhlcTracker(Observer):
     elif message['table'] == 'trade':
       for datum in message['data']:
         price = datum['price']
-        for bin in self.partials:
-          self.partials[bin]['close'] = price
-          if price > self.partials[bin]['high']:
-            self.partials[bin]['high'] = price
-          elif price < self.partials[bin]['low']:
-            self.partials[bin]['low'] = price
+        for bin in self.parts:
+          self.parts[bin]['close'] = price
+          if price > self.parts[bin]['high']:
+            self.parts[bin]['high'] = price
+          elif price < self.parts[bin]['low']:
+            self.parts[bin]['low'] = price
 
-  # Start updating indicators and writing partials
   def run(self):
+    '''Start updating indicators and writing partials.'''
 
     def quick_write_partial(bin):
-      partial = dict(self.partials[bin])
+      partial = dict(self.parts[bin])
       partial['timestamp'] = iso_str(partial['timestamp'])
       quick_write(filename_partial(bin), dumps(partial))
 
     def loop():
       while self.running:
-        for bin in self.data:
-          self.quick_write_partial(bin)
+        for bin in self.parts:
+          quick_write_partial(bin)
         sleep(DAEMON_TIMEOUT)
 
     self.running = True
@@ -406,4 +405,4 @@ if __name__ == '__main__':
     client.connect()
 
   # TODO remove debug tools
-  
+  df=ohlct.dataframes['1h']

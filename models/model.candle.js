@@ -19,6 +19,7 @@ const Candle = mongoose.model('Candle', new Schema({
   foreignNotional: Number,
 
   // indicators
+  sma_10:          Number,
   stochK:          Number,
   stochD:          Number,
   rsi:             Number,
