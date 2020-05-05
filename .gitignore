@@ -37,3 +37,6 @@ temp.*
 
 # Old WebStorm files
 .idea/
+
+# Visual Studio Code
+.vscode/ 

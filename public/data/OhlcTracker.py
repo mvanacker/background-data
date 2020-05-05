@@ -1,8 +1,13 @@
 from BitmexClient import BitmexClient
 from Observer import Observer
 from daemon import start_daemon, Starter, Stopper
-from indicators import ema, stoch, rsi_ema, smooth_stoch, hvp, part_ind
 from quick_write import quick_write, quick_read
+from pandicators import (sma, stoch, stoch_K, stoch_D, ema, change_up,
+                         change_down, rma_up, rma_down, rsi, hv, hvp, sma_part,
+                         ema_part, stoch_part, stoch_K_part, stoch_D_part,
+                         ema_part, change_up_part, change_down_part,
+                         rma_up_part, rma_down_part, rsi_part, hv_part,
+                         hvp_part)
 
 from sys import stdout
 from os.path import exists
@@ -15,13 +20,10 @@ from dateutil.relativedelta import relativedelta
 from argparse import ArgumentParser
 import requests
 import pandas as pd
+from math import nan, isnan
+from numbers import Number
 
-#--- MIRRORED
-
-from pprint import PrettyPrinter
-pp = PrettyPrinter()
-
-# Logger setup
+# Setup logger
 import logging
 logger = logging.getLogger()
 if __name__ == '__main__':
@@ -30,12 +32,11 @@ if __name__ == '__main__':
   ch.setFormatter(formatter)
   logger.addHandler(ch)
 
+# BitMEX client (ultimately only for REST API calls)
 client = BitmexClient(key=None, secret=None)
 
-#--- END MIRRORED
-
 # RESTful candle data API
-DATA_SERVER = 'http://localhost:3001/candles'
+DATA_SERVER = 'http://localhost:3001'
 s = requests.Session()
 
 # Filename constants
@@ -47,7 +48,7 @@ COUNT = 1000# results to fetch per request (max is 1000)
 TIMEOUT = 2# seconds, to be safe
 DAEMON_TIMEOUT = 1# second
 
-# Derived bins (DBINS)
+# Resampled bins (DBINS)
 to_tt = lambda t: t.timetuple()
 condition_hourly = lambda t, h: t.hour % h == 0
 condition_daily_mr = lambda t, m, r: mktime(t.timetuple()) % m == r
@@ -76,7 +77,6 @@ DCONDS = {
 }
 
 def resample(df, bin, dbin):
-
   '''Auxiliary function: resample dataframe (TODO naive).'''
 
   # Dataframe must be non-empty
@@ -120,7 +120,6 @@ def resample(df, bin, dbin):
   if result.empty:
     return result, close_candle(first_timestamp(bin, dbin, df.index[0])[0])
 
-  # 
   partial_candle = {
     'timestamp': result.index[-1] + TIMEDELTAS[dbin],
     'symbol': df['symbol'][0],
@@ -131,17 +130,6 @@ def resample(df, bin, dbin):
     'volume': 0 if is_opening else volume,
   }
   return result, partial_candle
-
-# Indicators
-INDICATORS = {
-  'ema-21': partial(ema, period=21),
-  'ema-55': partial(ema, period=55),
-  'ema-89': partial(ema, period=89),
-  'ema-200': partial(ema, period=200),
-  'stoch': smooth_stoch,
-  'rsi': rsi_ema,
-  'hvp': hvp,
-}
 
 # Auxiliary function: compute next timestamp
 # Note: this function is called after the condition is already met, on a
@@ -163,163 +151,259 @@ TIMEDELTAS = {
 }
 next_timestamp = lambda bin, t, n=1: t + n * TIMEDELTAS[bin]
 
-# TODO wrap my head around these. These were "derived experimentally"
+# Used for resampling. They "smooth out" the closing conditions (DCONDS).
 OFFSETS = {
   '1h': -1,
   '1d': 1,
 }
 
 def first_timestamp(bin, dbin, t):
-  '''Find the first valid timestamp of a derived bin.'''
+  '''Find the first valid timestamp of a resampled bin.'''
   n = 0
   while not DCONDS[bin][dbin](t):
     n += 1
     t += TIMEDELTAS[bin]
   return t, n
 
-# REST function: get candles
-get = lambda bin: parseTimestamps(s.get(f'{DATA_SERVER}?timeframe={bin}').json())
+def count(bin):
+  return int(s.get(f'{DATA_SERVER}/candles/count?timeframe={bin}').text)
+
+def get(bin):
+  '''REST function: get candles.'''
+  # uri = f'{DATA_SERVER}/candles?timeframe={bin}&limit=1000'
+  uri = f'{DATA_SERVER}/candles?timeframe={bin}'
+  return parseTimestamps(s.get(uri).json())
 
 def add(candle, bin):
   '''REST function: add candle.'''
-  candle = dict(candle) # makes (local) copy
+
+  # Transform
+  candle = dict(candle) # make (local) copy
   candle['timeframe'] = bin
   if type(candle['timestamp']) != str:
     candle['timestamp'] = iso_str(candle['timestamp'])
-  s.post(f'{DATA_SERVER}/add', json=candle)
+  
+  # Call REST, TODO a more sophisticated _id validation
+  uri = f'{DATA_SERVER}/candles'
+  if '_id' in candle and type(candle['_id']) == str:
+    s.put(uri, json=candle)
+  else:
+    s.post(uri, json=candle)
 
-def add_dataframe(df, bin):
-  '''semi-REST function: add dataframe.'''
-  df = df.reset_index()
-  df['timestamp'] = df['timestamp'].apply(iso_str)
-  for candle in df.to_dict(orient='records'):
+def add_dataframe(df, bin, suppress=True):
+  '''Semi-REST function: add dataframe.'''
+
+  # Disable logging here to suppress the requests module's spam
+  if suppress:
+    logging.disable(logging.CRITICAL)
+  
+  for candle in (df.reset_index()
+                   .replace({ nan: None })
+                   .to_dict(orient='records')):
     add(candle, bin)
 
-# Auxiliary function: datetime object to ISO string
-iso_str = lambda dt: dt.isoformat().replace('+00:00', '.000Z')
+  if suppress:
+    logging.disable(logging.NOTSET)
+
+def iso_str(dt):
+  '''Auxiliary function: unparse datetime object to ISO string.'''
+  return dt.isoformat().replace('+00:00', '.000Z')
 
 def parseTimestamps(data):
-  '''Auxiliary function: parse timestamps.'''
+  '''Auxiliary function: parse timestamps inside a dict.'''
   for row in data:
     row['timestamp'] = isoparse(row['timestamp'])
   return data
 
+# Indicators
+INDICATORS = [
+  partial(sma, period=10),
+  partial(sma, period=200),
+  
+  partial(ema, period=21),
+  partial(ema, period=55),
+  partial(ema, period=89),
+  partial(ema, period=200),
+  partial(ema, period=377),
+  
+  stoch,
+  stoch_K,
+  stoch_D,
+  
+  change_up,
+  change_down,
+  rma_up,
+  rma_down,
+  rsi,
+
+  hv,
+  hvp,
+]
+PART_INDS = [
+  partial(sma_part, period=10),
+  partial(sma_part, period=200),
+  
+  partial(ema_part, period=21),
+  partial(ema_part, period=55),
+  partial(ema_part, period=89),
+  partial(ema_part, period=200),
+  partial(ema_part, period=377),
+  
+  stoch_part,
+  stoch_K_part,
+  stoch_D_part,
+  
+  change_up_part,
+  change_down_part,
+  rma_up_part,
+  rma_down_part,
+  rsi_part,
+
+  hv_part,
+  hvp_part,
+]
+
 class OhlcTracker(Observer):
   '''Tracks historical and partial data.'''
-  def __init__(self, derive=True):
-    self.logger = logging.getLogger(__name__)
-
-    self.derive = derive
-    self.dataframes = {}
+  def __init__(self, resample=True, insert=True):
+    self.resample = resample
+    self.insert = insert
+    self.data = {}
     self.parts = {}
-    
+    self.fetched_source = False
+    self.fetched_resamples = False
     # self.build()
 
-  #
-  def build(self, repeat=False):
-    self.build_orig(repeat)
-    if self.derive:
-      self.build_deriv(repeat)
+  def build(self):
+    '''Build original and resampled dataframes. Update on repeated calls. Apply indicators. Insert into database.'''
+    action = 'UPDATE' if self.fetched_source else 'BUILD'
+    logger.info(f'========== {action} STARTED')
+    logger.info('========== PHASE 1 ===== FETCH & PARSE')
+    logger.info('========== PHASE 1.1 === SOURCE DATA')
+    self.fetch_source()
+    self.fetched_source = True
+    if self.resample:
+      logger.info('========== PHASE 1.2 === RESAMPLE DATA')
+      self.fetch_resamples()
+      self.fetched_resamples = True
+    logger.info('========== PHASE 2 ===== APPLY & UPSERT')
+    self.apsert()
+    logger.info(f'========== {action} ENDED')
+    return self
 
-  def build_orig(self, repeat=False):
-    '''Fetch historical data, insert diff into database, write partials to file.'''
+  def fetch_source(self):
+    '''Fetch missing historical data.'''
     for bin in BINS:
       
-      # Fetch previous data, init dataframe, starting point implied
-      if not repeat:
-        self.build_dataframe(bin)
-      start = len(self.dataframes[bin])
-      self.logger.info(f'Updating {bin} data (start from {start}).')
+      # Fetch previous data into dataframe
+      if not self.fetched_source:
+        self.fetch_data(bin)
+
+      # Fetch starting point  
+      start = 1 + count(bin)
+      logger.info(f'Updating {bin} data (start from {start}).')
 
       # Fetch historical data
       while True:
         t0 = time()
         
-        # Remote work: fetch from BitMEX
+        # Remote fetch from BitMEX
         data = parseTimestamps(client.rest.get_buckets(bin, start, count=COUNT))
         if len(data) < COUNT:
-          self.logger.debug(f'[{time() - t0}] BitMEX response: {data}')
+          logger.debug(f'[{time() - t0}] BitMEX response: {data}')
+
+        # Concatenate new data to dataframe
+        df = pd.DataFrame(data)
+        if len(data):
+          df = df.set_index('timestamp')
+        df = pd.concat([self.data[bin], df], sort=False)
+        self.data[bin] = df
+        logger.info(f'{bin} candles: {len(df)} (+{len(data)})')
 
         # Stop condition (nothing left to fetch)
-        if not data: break 
-
-        # Local work: append to dataframes and data
-        df = pd.DataFrame(data).set_index('timestamp')
-        self.dataframes[bin] = pd.concat([self.dataframes[bin], df], sort=False)
-        self.logger.debug(f'{bin}: {len(self.dataframes[bin])} (+{len(data)})')
-
-        # Local work: database insertion
-        self.logger.debug(f'[{time() - t0}] Inserting into database...')
-        for candle in data:
-          add(candle, bin)
+        if not data: break
 
         # Miscellaneous bureaucracy
         start += COUNT
         dur = TIMEOUT - time() + t0
         if dur > 0: 
-          self.logger.debug(f'Sleeping for {dur}')
+          logger.debug(f'Sleeping for {dur}')
           sleep(dur)
 
       # Fetch partial
       self.parts[bin] = client.rest.get_buckets(bin, start, partial=True)[0]
-      self.parts[bin]['timestamp'] = isoparse(self.parts[bin]['timestamp'])
 
-  def build_deriv(self, repeat=False):
-    '''Derive data.'''
+  def fetch_resamples(self):
+    '''Resample data from original data.'''
     for bin in BINS:
       for dbin in DBINS[bin]:
-        if logger.level >= logging.DEBUG: print()
         
-        # Get previous data from database, init dataframe
-        if not repeat:
-          self.build_dataframe(dbin)
+        # Fetch previous data into dataframe
+        if not self.fetched_resamples:
+          self.fetch_data(dbin)
+        df = self.data[dbin]
         
-        # Determine resample starting point
+        # Determine resampling starting point
         row = 0
-        if not self.dataframes[dbin].empty:
-          lt = self.dataframes[dbin].index[-1]
-          ft, n = first_timestamp(bin, dbin, t=self.dataframes[bin].index[0])
-          row = n + (lt - ft) / TIMEDELTAS[bin] + OFFSETS[bin]
-          assert int(row) == row
-          row = int(row)
-          
-          self.logger.debug(f'  ft  {ft}')
-          self.logger.debug(f'  n   {n}')
-          self.logger.debug(f'  lt  {lt}')
-          self.logger.debug(f'  row {row}')
-          if row == len(self.dataframes[bin]): self.logger.debug(f'      <no timestamp at row {row}>')
-          elif row > len(self.dataframes[bin]): self.logger.debug(f'      <CRITICAL ERROR: tried to read timestamp at row {row}>')
-          else: self.logger.debug(f"      {self.dataframes[bin].index[row]}")
-        self.logger.debug(f'Deriving {dbin} (from {row}/{len(self.dataframes[bin])} total {len(self.dataframes[bin])-row} rows)')
-
+        if not df.empty:
+          lt = df.index[-1]
+          ft, n = first_timestamp(bin, dbin, t=self.data[bin].index[0])
+          row = int(n + (lt - ft) / TIMEDELTAS[bin] + OFFSETS[bin])
+        
         # Resample bin into dbin
-        if row < len(self.dataframes[bin]):
-          data, self.parts[dbin] = resample(self.dataframes[bin].iloc[row:], bin, dbin)
-          self.dataframes[dbin] = pd.concat([self.dataframes[dbin], data], sort=False)
+        if row < len(self.data[bin]):
+          logger.info(f'Resampling {bin} data into {dbin} data...')
+          data, self.parts[dbin] = resample(self.data[bin].iloc[row:], bin, dbin)
+          df = pd.concat([df, data], sort=False)
+          logger.info(f'{dbin} candles: {len(df)} (+{len(data)})')
 
-          # Update derived partial with original's partial
+          # Update resampled partial with original's partial
           self.parts[dbin]['high'] = max(self.parts[bin]['high'],
                                          self.parts[dbin]['high'])
           self.parts[dbin]['low'] = min(self.parts[bin]['low'],
                                         self.parts[dbin]['low'])
           self.parts[dbin]['close'] = self.parts[bin]['close']
-
-          # Insert new candles into database
-          self.logger.debug(f'adding \n{str(data)}')
-          if not data.empty:
-            add_dataframe(data, dbin)
+          
+          # Unparse a partial's timestamp to save time when upserting to db
+          self.parts[dbin]['timestamp'] = iso_str(self.parts[dbin]['timestamp'])
 
         # Case where no resampling is necessary (so no candles to insert either)
         else:
+          logger.info(f'No need to resample {bin} data into {dbin} data')
+          logger.info(f'{dbin} candles: {len(self.data[dbin])} (+0)')
           self.parts[dbin] = self.parts[bin]
 
-        self.logger.debug(f'{dbin} partial {str(self.parts[dbin])}')
+  def fetch_data(self, bin):
+    '''Transform dict into pandas DataFrame.'''
+    logger.info(f'Fetching {bin} data...')
+    self.data[bin] = pd.DataFrame(get(bin)).replace({ None: nan })
+    if not self.data[bin].empty:
+      self.data[bin].set_index('timestamp', inplace=True)
 
-  def build_dataframe(self, bin):
-    '''TODO comment.'''
-    self.dataframes[bin] = pd.DataFrame(get(bin))
-    if not self.dataframes[bin].empty:
-      self.dataframes[bin].set_index('timestamp', inplace=True)
+  def apsert(self):
+    '''Apply indicators and insert into database.'''
+    for bin, df in self.data.items():
+      t0 = time()
+
+      # Apply indicators
+      logger.info(f'Applying indicators to {bin}...')
+      first_aff_row = self.apply_indicators(bin)
+      logger.debug(f'[{time() - t0}] First affected {first_aff_row}/{len(df)}')
+
+      # Upsert into database
+      if self.insert:
+        aff_df = df.loc[df.index[first_aff_row:]]
+        logger.info(f'Upserting {len(aff_df)} affected {bin} candles...')
+        if not aff_df.empty:
+          add_dataframe(aff_df, bin)
+          logger.debug(f'[{time() - t0}] Upsertion done.')
+      else:
+        logger.info('Not upserting into database.')
+
+
+  def apply_indicators(self, bin):
+    '''Add all indicator columns to a dataframe.'''
+    return min(indicator(self.data[bin]) for indicator in INDICATORS)
 
   def update(self, observable, message):
     '''This method is to be called by the socket's message notifier.'''
@@ -327,9 +411,9 @@ class OhlcTracker(Observer):
     # Update historical data
     if message['table'] == 'tradeBin1h' or message['table'] == 'tradeBin1d':
       if message['action'] == 'insert':
-        self.build(repeat=True)
+        self.build()
 
-    # Update partial data
+    # Update partial HLC data
     elif message['table'] == 'trade':
       for datum in message['data']:
         price = datum['price']
@@ -339,35 +423,59 @@ class OhlcTracker(Observer):
             self.parts[bin]['high'] = price
           elif price < self.parts[bin]['low']:
             self.parts[bin]['low'] = price
+        
 
   def run(self):
-    '''Start updating indicators and writing partials.'''
+    '''Start updating indicators and upserting partials in a separate thread.'''
 
-    def quick_write_partial(bin):
+    def upsert_partial(bin, suppress=True):
+      if suppress:
+        logging.disable(logging.CRITICAL)
+
       partial = dict(self.parts[bin])
-      partial['timestamp'] = iso_str(partial['timestamp'])
-      quick_write(filename_partial(bin), dumps(partial))
+      for k, v in partial.items():
+        if isinstance(v, Number) and isnan(v):
+          partial[k] = None
+      s.put(f'{DATA_SERVER}/partials?timeframe={bin}', json=partial)
+
+      if suppress:
+        logging.disable(logging.NOTSET)
 
     def loop():
       while self.running:
+        t0 = time()
         for bin in self.parts:
-          quick_write_partial(bin)
-        sleep(DAEMON_TIMEOUT)
+
+          # Update partial indicators
+          for part_ind in PART_INDS:
+            part_ind(self.data[bin], self.parts[bin])
+
+          # Upsert into db
+          upsert_partial(bin)
+
+        # Limit iterations
+        logger.debug(f'Iteration took {time()-t0}')
+        sleep(max(DAEMON_TIMEOUT - time() + t0, 0))
 
     self.running = True
     start_daemon(target=loop)
 
-DEFAULT_VERBOSITY = logging.DEBUG
+DEFAULT_VERBOSITY = logging.INFO
 if __name__ == '__main__':
 
   # Add options
   parser = ArgumentParser()
   parser.add_argument('-c', '--do-not-connect', action='store_true',
-                      help='Don\'t connect to BitMEX\' websocket.')
-  parser.add_argument('-d', '--do-not-derive', action='store_true',
-                      help='Don\'t derive bins.', default=False)
+                      help='Don\'t connect to BitMEX\' websocket.',
+                      default=False)
+  parser.add_argument('-r', '--do-not-resample', action='store_true',
+                      help='Don\'t resample bins.',
+                      default=False)
+  parser.add_argument('-i', '--do-not-insert', action='store_true',
+                      help='Don\'t insert into database.',
+                      default=False)
   parser.add_argument('-v', '--verbosity', type=int,
-                      help='Verbosity level, DEBUG=10, INFO=20.',
+                      help='Verbosity level, INFO=20, DEBUG=10, ...',
                       default=DEFAULT_VERBOSITY)
   args = parser.parse_args()
 
@@ -376,10 +484,13 @@ if __name__ == '__main__':
     logger.info(f'[-v flag]: Verbosity level set to {args.verbosity}.')
   if args.do_not_connect:
     logger.info('[-c flag]: Not connecting to BitMEX\' websocket.')
-  if args.do_not_derive:
-    logger.info('[-d flag]: Not deriving bins.')
+  if args.do_not_resample:
+    logger.info('[-r flag]: Not resampling bins.')
+  if args.do_not_insert:
+    logger.info('[-i flag]: Not inserting data.')
 
-  ohlct = OhlcTracker(derive=not args.do_not_derive)
+  ohlct = OhlcTracker(resample=not args.do_not_resample,
+                      insert=not args.do_not_insert)
   ohlct.build()
 
   # Setup websocket and connect to it
@@ -403,6 +514,3 @@ if __name__ == '__main__':
     client.websocket.ready_notifier.add_observer(Starter(ohlct))
     client.websocket.close_notifier.add_observer(Stopper(ohlct))
     client.connect()
-
-  # TODO remove debug tools
-  df=ohlct.dataframes['1h']

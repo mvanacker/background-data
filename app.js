@@ -24,6 +24,7 @@ app.use('/users', require('./routes/users'));
 app.use('/trades', require('./routes/trades'));
 app.use('/comments', require('./routes/comments'));
 app.use('/candles', require('./routes/candles'));
+app.use('/partials', require('./routes/partials'));
 
 // catch 404 and forward to error handler
 app.use(function(req, res, next) {
