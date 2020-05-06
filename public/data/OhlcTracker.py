@@ -355,6 +355,7 @@ class OhlcTracker(Observer):
           logger.info(f'Resampling {bin} data into {dbin} data...')
           data, self.parts[dbin] = resample(self.data[bin].iloc[row:], bin, dbin)
           df = pd.concat([df, data], sort=False)
+          self.data[dbin] = df
           logger.info(f'{dbin} candles: {len(df)} (+{len(data)})')
 
           # Update resampled partial with original's partial
