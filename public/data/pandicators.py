@@ -17,7 +17,7 @@ def apply_indicator(df, name, indicator, period):
   add_values(df, name, values)
 
   # Return the loc of the first affected row
-  return 0 if loc is None else loc + 1
+  return len(df) if loc is None else (loc + 1 if name in df else 0)
 
 def last_valid_loc(df, name):
   i = df[name].last_valid_index()
@@ -193,3 +193,12 @@ def hvp_part(df, part, period=100, hv='hv'):
   percentile = _percentile(period)
   last_hvs = df.loc[df.index[-period:], hv].append(pd.Series([part[hv]]))
   part['hvp'] = percentile(last_hvs)
+
+def hvp_ma(df, period=20, hvp='hvp'):
+  '''Add a historical volatility percentile moving average column to a dataframe.'''
+  indicator = _sma_core(period, src=hvp)
+  return apply_indicator(df, 'hvp_ma', indicator, period)
+
+def hvp_ma_part(df, part, period=20, hvp='hvp'):
+  '''Compute historical volatility percentile moving average partial value.'''
+  part['hvp_ma'] = _sma_part_core(df, part, period, src=hvp)

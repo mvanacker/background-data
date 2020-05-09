@@ -40,6 +40,10 @@ const candleSchema = new Schema({
 
   hv:              Number,
   hvp:             Number,
+  hvp_ma:          Number,
+
+  // forecast field(s)
+  level:           Number,
 }, {
   timestamps: true,
 });

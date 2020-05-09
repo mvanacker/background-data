@@ -1,9 +1,9 @@
 from BitmexClient import BitmexClient
 from Observer import Observer
-# from OhlcTracker import OhlcTracker
+from OhlcTracker import OhlcTracker
 from polling import poll_fng, poll_cmc, poll_deribit
 from quick_write import quick_write
-from daemon import start_daemon, Stopper
+from daemon import start_daemon, Stopper, Starter
 
 from sys import stdout
 from statistics import mean
@@ -24,11 +24,12 @@ pp = PrettyPrinter()
 import logging
 # Logger setup
 logger = logging.getLogger()
-logger.setLevel(logging.DEBUG)# Change this to DEBUG if you want a lot more info
-ch = logging.StreamHandler(stdout)
-formatter = logging.Formatter("%(asctime)s: %(message)s")
-ch.setFormatter(formatter)
-logger.addHandler(ch)
+if __name__ == '__main__':
+  logger.setLevel(logging.INFO)
+  ch = logging.StreamHandler(stdout)
+  formatter = logging.Formatter("%(asctime)s: %(message)s")
+  ch.setFormatter(formatter)
+  logger.addHandler(ch)
 
 ### End Debug
 
@@ -53,8 +54,9 @@ OPEN_INTEREST_FILE = 'open-interest.txt'
 OPEN_INTERESTS_FILE = 'open-interest.json'
 OPEN_INTEREST_HISTORY_FILE = 'open-interest-history.json'
 
-# Measures volume flow
 class VolumeFlowMeasurer(Observer):
+  '''Measures volume flow.'''
+
   def __init__(self, futures=[]):
 
     # Volume flow fields
@@ -71,7 +73,8 @@ class VolumeFlowMeasurer(Observer):
     self.open_interest = nan
     self.open_interest_history = deque()
 
-    # Start measurement thread
+  def run(self):
+    '''Start measurement thread.'''
     self.running = True
     start_daemon(target=self.iterate)
 
@@ -207,13 +210,15 @@ if __name__ == '__main__':
   }
   client.websocket.manual_subscriptions = [f'instrument:{i}' for i in futures]
 
-  # Plug in volume flow measurer
-  vfm = VolumeFlowMeasurer(futures)
-  client.websocket.message_notifier.add_observer(vfm)
-  client.websocket.close_notifier.add_observer(Stopper(vfm))
-
-  # Plug in OHLC tracker
-  # client.websocket.message_notifier.add_observer(OhlcTracker())
-
+  # Plug in volume flow measurer and OHLC (+indicators) tracker
+  observers = [
+    VolumeFlowMeasurer(futures),
+    # OhlcTracker().build(),
+  ]
+  for obs in observers:
+    client.websocket.message_notifier.add_observer(obs)
+    client.websocket.ready_notifier.add_observer(Starter(obs))
+    client.websocket.close_notifier.add_observer(Stopper(obs))
+    
   # And bam
   client.connect()

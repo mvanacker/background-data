@@ -1,27 +1,33 @@
-from BitmexClient import BitmexClient
-from Observer import Observer
-from daemon import start_daemon, Starter, Stopper
-from quick_write import quick_write, quick_read
-from pandicators import (sma, stoch, stoch_K, stoch_D, ema, change_up,
-                         change_down, rma_up, rma_down, rsi, hv, hvp, sma_part,
-                         ema_part, stoch_part, stoch_K_part, stoch_D_part,
-                         ema_part, change_up_part, change_down_part,
-                         rma_up_part, rma_down_part, rsi_part, hv_part,
-                         hvp_part)
-
 from sys import stdout
 from os.path import exists
 from functools import partial
 from time import time, sleep, mktime
+from pytz import UTC
 from json import loads, dumps
 from datetime import datetime, timedelta
 from dateutil.parser import isoparse
 from dateutil.relativedelta import relativedelta
 from argparse import ArgumentParser
-import requests
-import pandas as pd
-from math import nan, isnan
+from requests import Session
+from math import nan, isnan, sqrt
 from numbers import Number
+from collections import deque
+from threading import Lock
+import pandas as pd
+
+# dbg remove
+from threading import Thread
+
+from BitmexClient import BitmexClient
+from Observer import Observer
+from daemon import start_daemon, Starter, Stopper
+from pandicators import (sma, stoch, stoch_K, stoch_D, ema, change_up,
+                         change_down, rma_up, rma_down, rsi, hv, hvp, sma_part,
+                         ema_part, stoch_part, stoch_K_part, stoch_D_part,
+                         ema_part, change_up_part, change_down_part,
+                         rma_up_part, rma_down_part, rsi_part, hv_part,
+                         hvp_part, hvp_ma, hvp_ma_part)
+from pricing import BlackScholes
 
 # Setup logger
 import logging
@@ -36,17 +42,19 @@ if __name__ == '__main__':
 client = BitmexClient(key=None, secret=None)
 
 # RESTful candle data API
-DATA_SERVER = 'http://localhost:3001'
-s = requests.Session()
-
-# Filename constants
-filename_partial = lambda bin: f'ohlc-{bin}-partial.json'
+DATA_URI = 'http://localhost:3001'
+s = Session()
 
 # Runtime constants
 BINS = ['1h', '1d']
 COUNT = 1000# results to fetch per request (max is 1000)
 TIMEOUT = 2# seconds, to be safe
-DAEMON_TIMEOUT = 1# second
+PARTIAL_DAEMON_TIMEOUT = 5# second
+FORECAST_DAEMON_TIMEOUT = 60# second
+LOCK = Lock()
+FORECAST_CUTOFF = 101# amount of rows to consider when applying indicators to
+                     # estimated future prices, this value should be greater
+                     # than any period of any indicator applied
 
 # Resampled bins (DBINS)
 to_tt = lambda t: t.timetuple()
@@ -166,44 +174,59 @@ def first_timestamp(bin, dbin, t):
   return t, n
 
 def count(bin):
-  return int(s.get(f'{DATA_SERVER}/candles/count?timeframe={bin}').text)
+  return int(s.get(f'{DATA_URI}/candles/count?timeframe={bin}').text)
 
 def get(bin):
   '''REST function: get candles.'''
-  # uri = f'{DATA_SERVER}/candles?timeframe={bin}&limit=1000'
-  uri = f'{DATA_SERVER}/candles?timeframe={bin}'
+  # uri = f'{DATA_URI}/candles?timeframe={bin}&limit=1000'
+  uri = f'{DATA_URI}/candles?timeframe={bin}'
   return parseTimestamps(s.get(uri).json())
 
-def add(candle, bin):
-  '''REST function: add candle.'''
-
-  # Transform
+def transform(bin, candle):
+  '''Transform candle before sending it off to the database.'''
   candle = dict(candle) # make (local) copy
   candle['timeframe'] = bin
   if type(candle['timestamp']) != str:
     candle['timestamp'] = iso_str(candle['timestamp'])
-  
-  # Call REST, TODO a more sophisticated _id validation
-  uri = f'{DATA_SERVER}/candles'
+  return candle
+
+def add(bin, candle):
+  '''REST function: add candle.'''
+  uri=f'{DATA_URI}/candles'
+  candle = transform(bin, candle)
+
+  # Note: _id validation here is not very sophisticated
   if '_id' in candle and type(candle['_id']) == str:
     s.put(uri, json=candle)
   else:
     s.post(uri, json=candle)
 
-def add_dataframe(df, bin, suppress=True):
+def to_dict(df):
+  '''Convert dataframe to dict before sending them off to the database.'''
+  return df.reset_index().replace({ nan: None }).to_dict(orient='records')
+
+def add_dataframe(df, bin, func=add, suppress=True):
   '''Semi-REST function: add dataframe.'''
 
   # Disable logging here to suppress the requests module's spam
-  if suppress:
-    logging.disable(logging.CRITICAL)
-  
-  for candle in (df.reset_index()
-                   .replace({ nan: None })
-                   .to_dict(orient='records')):
-    add(candle, bin)
+  if suppress: logging.disable(logging.CRITICAL)
+  for candle in to_dict(df): func(bin, candle)
+  if suppress: logging.disable(logging.NOTSET)
 
-  if suppress:
-    logging.disable(logging.NOTSET)
+def add_forecast(bin, candle, level):
+  '''REST function: add forecast.'''
+  candle = transform(bin, candle)
+  candle = {k : v for k, v in candle.items() if v is not None}
+  candle['level'] = level
+  s.put(f'{DATA_URI}/forecast?timeframe={bin}&level={level}', json=candle)
+
+def add_dataframe_forecast(df, bin, level, suppress=True):
+  '''Semi-REST function: add forecast dataframe.'''
+  f = partial(add_forecast, level=level)
+  add_dataframe(df, bin, func=f, suppress=suppress)
+
+def clear_forecasts():
+  s.delete(f'{DATA_URI}/forecast')
 
 def iso_str(dt):
   '''Auxiliary function: unparse datetime object to ISO string.'''
@@ -238,6 +261,7 @@ INDICATORS = [
 
   hv,
   hvp,
+  hvp_ma,
 ]
 PART_INDS = [
   partial(sma_part, period=10),
@@ -261,35 +285,49 @@ PART_INDS = [
 
   hv_part,
   hvp_part,
+  hvp_ma_part,
 ]
+
+# Forecasting
+bs = BlackScholes()
+DEPTH = 3
+ANNUAL = 100
+# ANNUAL_TD = timedelta(days=ANNUAL)
+SD_LVLS = [.68, .95, .997]
+SD_LVLS = [.5 - lvl / 2 for lvl in SD_LVLS]# adjusted for reverse computations
+TOUCH_LVLS = [lvl / 2 for lvl in SD_LVLS]
 
 class OhlcTracker(Observer):
   '''Tracks historical and partial data.'''
+
   def __init__(self, resample=True, insert=True):
     self.resample = resample
     self.insert = insert
     self.data = {}
     self.parts = {}
+    self.forecasts = {}
     self.fetched_source = False
     self.fetched_resamples = False
-    # self.build()
 
   def build(self):
     '''Build original and resampled dataframes. Update on repeated calls. Apply indicators. Insert into database.'''
-    action = 'UPDATE' if self.fetched_source else 'BUILD'
-    logger.info(f'========== {action} STARTED')
-    logger.info('========== PHASE 1 ===== FETCH & PARSE')
-    logger.info('========== PHASE 1.1 === SOURCE DATA')
-    self.fetch_source()
-    self.fetched_source = True
-    if self.resample:
-      logger.info('========== PHASE 1.2 === RESAMPLE DATA')
-      self.fetch_resamples()
-      self.fetched_resamples = True
-    logger.info('========== PHASE 2 ===== APPLY & UPSERT')
-    self.apsert()
-    logger.info(f'========== {action} ENDED')
-    return self
+    with LOCK:
+      action = 'UPDATE' if self.fetched_source else 'BUILD'
+      logger.info(f'========== {action} STARTED')
+      logger.info('========== PHASE 1 ===== FETCH & PARSE')
+      logger.info('========== PHASE 1.1 === SOURCE DATA')
+      self.fetch_source()
+      self.fetched_source = True
+      if self.resample:
+        logger.info('========== PHASE 1.2 === RESAMPLE DATA')
+        self.fetch_resamples()
+        self.fetched_resamples = True
+      logger.info('========== PHASE 2 ===== APPLY & UPSERT')
+      self.apsert()
+      logger.info('========== PHASE 3 ===== PREPARE FORECASTS')
+      self.prep_forecasts()
+      logger.info(f'========== {action} ENDED')
+      return self
 
   def fetch_source(self):
     '''Fetch missing historical data.'''
@@ -388,7 +426,7 @@ class OhlcTracker(Observer):
 
       # Apply indicators
       logger.info(f'Applying indicators to {bin}...')
-      first_aff_row = self.apply_indicators(bin)
+      first_aff_row = self.apply_indicators(self.data[bin])
       logger.debug(f'[{time() - t0}] First affected {first_aff_row}/{len(df)}')
 
       # Upsert into database
@@ -401,10 +439,20 @@ class OhlcTracker(Observer):
       else:
         logger.info('Not upserting into database.')
 
-
-  def apply_indicators(self, bin):
+  def apply_indicators(self, df):
     '''Add all indicator columns to a dataframe.'''
-    return min(indicator(self.data[bin]) for indicator in INDICATORS)
+    return min(indicator(df) for indicator in INDICATORS)
+
+  def prep_forecasts(self):
+    '''Prepare forecasts by precomputing the volatility and timestamps to feed into the reverse computations. Also clear all forecasts on the data server. That is the easiest way to get rid of the outdated forecasts which wouldn't be overwritten anymore.'''
+    self.volatility = self.data['1d']['hv'][-1] * sqrt(ANNUAL)
+    self.times = {}
+    for bin in self.data:
+      self.times[bin] = []
+      t = self.data[bin].index[-1]
+      for depth in range(1, 1 + DEPTH):
+        self.times[bin].append(next_timestamp(bin, t, depth))
+    clear_forecasts()
 
   def update(self, observable, message):
     '''This method is to be called by the socket's message notifier.'''
@@ -424,42 +472,95 @@ class OhlcTracker(Observer):
             self.parts[bin]['high'] = price
           elif price < self.parts[bin]['low']:
             self.parts[bin]['low'] = price
-        
 
   def run(self):
-    '''Start updating indicators and upserting partials in a separate thread.'''
+    '''Start updating indicators, upserting partials and upserting forecasts in a separate thread.'''
 
-    def upsert_partial(bin, suppress=True):
-      if suppress:
-        logging.disable(logging.CRITICAL)
+    def partial_loop():
+      def upsert_partial(bin, suppress=True):
+        if suppress:
+          logging.disable(logging.CRITICAL)
 
-      partial = dict(self.parts[bin])
-      for k, v in partial.items():
-        if isinstance(v, Number) and isnan(v):
-          partial[k] = None
-      s.put(f'{DATA_SERVER}/partials?timeframe={bin}', json=partial)
+        partial = dict(self.parts[bin])
+        for k, v in partial.items():
+          if isinstance(v, Number) and isnan(v):
+            partial[k] = None
+        s.put(f'{DATA_URI}/partials?timeframe={bin}', json=partial)
 
-      if suppress:
-        logging.disable(logging.NOTSET)
+        if suppress:
+          logging.disable(logging.NOTSET)
 
-    def loop():
       while self.running:
         t0 = time()
-        for bin in self.parts:
+        with LOCK:
+          for bin in self.parts:
 
-          # Update partial indicators
-          for part_ind in PART_INDS:
-            part_ind(self.data[bin], self.parts[bin])
+            # Update partial indicators
+            for part_ind in PART_INDS:
+              part_ind(self.data[bin], self.parts[bin])
 
-          # Upsert into db
-          upsert_partial(bin)
+            # Upsert into db
+            if self.insert:
+              upsert_partial(bin)
 
         # Limit iterations
-        logger.debug(f'Iteration took {time()-t0}')
-        sleep(max(DAEMON_TIMEOUT - time() + t0, 0))
+        logger.debug(f'Partial loop\'s iteration took {time()-t0}')
+        sleep(max(PARTIAL_DAEMON_TIMEOUT - time() + t0, 0))
+
+    def forecast_loop():
+      def compute_forecast(bin):
+        self.forecasts[bin] = []
+        annualize = lambda dt: dt.total_seconds() / (86400 * ANNUAL)
+        price = self.parts[bin]['close']
+        now = datetime.utcnow().replace(tzinfo=UTC)
+        levels = deque([DEPTH * [price]])
+
+        # Forecast prices at 1st, 2nd and 3rd standard deviation levels
+        for prob in SD_LVLS:
+          lower, upper = list(zip(*[
+            bs.reverse(prob, price, self.volatility, annualize(time - now))
+            for time in self.times[bin]
+          ]))
+          levels.appendleft(lower)
+          levels.append(upper)
+
+        # Apply indicators to forecast prices
+        ohlc = lambda t, p: {
+          'timestamp': t, 'open': p, 'high': p, 'low': p, 'close': p
+        }
+        for level in levels:
+          rows = [ohlc(t, p) for t, p in zip(self.times[bin], level)]
+          proxy = pd.DataFrame(rows).set_index('timestamp')
+
+          # This optimization significantly cuts computation time
+          # (-50% at the time)
+          real = self.data[bin]
+          real = real.loc[real.index[-FORECAST_CUTOFF:]]
+
+          proxy = real.append(proxy, sort=False)
+          self.apply_indicators(proxy)
+          self.forecasts[bin].append(proxy.tail(DEPTH))
+
+        # Upsert forecast to db
+        for level, df in enumerate(self.forecasts[bin]):
+          add_dataframe_forecast(df, bin, level)
+
+      while self.running:
+        t0 = time()
+        with LOCK:
+          try:
+            for bin in self.data:
+              compute_forecast(bin)
+          except ValueError as e:
+            logger.warning(f'Warning: caught ValueError while forecasting: {e}')
+
+        # Limit iterations
+        logger.debug(f'Forecast loop\'s iteration took {time()-t0}')
+        sleep(max(FORECAST_DAEMON_TIMEOUT - time() + t0, 0))
 
     self.running = True
-    start_daemon(target=loop)
+    start_daemon(target=partial_loop)
+    start_daemon(target=forecast_loop)
 
 DEFAULT_VERBOSITY = logging.INFO
 if __name__ == '__main__':
@@ -495,23 +596,35 @@ if __name__ == '__main__':
   ohlct.build()
 
   # Setup websocket and connect to it
+  client.websocket.symbols = ['XBTUSD']
+  client.websocket.subscriptions = {
+    'execution': False,
+    'instrument': False,
+    'order': False,
+    'orderBookL2': False,
+    'position': False,
+    'quote': False,
+    'trade': True,
+    'margin': False,
+    'tradeBin1m': False,
+    'tradeBin5m': False,
+    'tradeBin1h': True,
+    'tradeBin1d': True,
+  }
+  client.websocket.message_notifier.add_observer(ohlct)
+  client.websocket.ready_notifier.add_observer(Starter(ohlct))
+  client.websocket.close_notifier.add_observer(Stopper(ohlct))
+    
+  # Bit of a hack
+  # class Interrupter(Observer):
+  #   def update(self, o, m):
+  #     def bomb():
+  #       sleep(60)
+  #       client.websocket.auto_reconnect = False
+  #       client.websocket.ws.close()
+  #       ohlct.running = False
+  #     Thread(target=bomb).start()
+  # client.websocket.ready_notifier.add_observer(Interrupter())
+
   if not args.do_not_connect:
-    client.websocket.symbols = ['XBTUSD']
-    client.websocket.subscriptions = {
-      'execution': False,
-      'instrument': False,
-      'order': False,
-      'orderBookL2': False,
-      'position': False,
-      'quote': False,
-      'trade': True,
-      'margin': False,
-      'tradeBin1m': False,
-      'tradeBin5m': False,
-      'tradeBin1h': True,
-      'tradeBin1d': True,
-    }
-    client.websocket.message_notifier.add_observer(ohlct)
-    client.websocket.ready_notifier.add_observer(Starter(ohlct))
-    client.websocket.close_notifier.add_observer(Stopper(ohlct))
     client.connect()
