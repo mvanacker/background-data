@@ -111,7 +111,7 @@ class BlackScholes(PricingModel):
 
   def reverse(self, prob, strike, volatility, time):
     vt = volatility ** 2 * time / 2
-    svt = sqrt(vt)
+    svt = sqrt(2 * vt)
     foo = norm.ppf(prob) + svt
     lower = strike * exp(foo * svt - vt)
     upper = strike * exp(-foo * svt - vt)

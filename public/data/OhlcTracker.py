@@ -13,6 +13,7 @@ from math import nan, isnan, sqrt
 from numbers import Number
 from collections import deque
 from threading import Lock
+from numpy import mean
 import pandas as pd
 
 # dbg remove
@@ -126,7 +127,8 @@ def resample(df, bin, dbin):
 
   # Close condition was never met
   if result.empty:
-    return result, close_candle(first_timestamp(bin, dbin, df.index[0])[0])
+    ft = first_timestamp(bin, dbin, df.index[0])[0]
+    return result, close_candle(ft)
 
   partial_candle = {
     'timestamp': result.index[-1] + TIMEDELTAS[dbin],
@@ -166,7 +168,7 @@ OFFSETS = {
 }
 
 def first_timestamp(bin, dbin, t):
-  '''Find the first valid timestamp of a resampled bin.'''
+  '''Find the first valid timestamp (following t) of a resampled bin.'''
   n = 0
   while not DCONDS[bin][dbin](t):
     n += 1
@@ -290,7 +292,7 @@ PART_INDS = [
 
 # Forecasting
 bs = BlackScholes()
-DEPTH = 3
+DEPTH = 6
 ANNUAL = 100
 # ANNUAL_TD = timedelta(days=ANNUAL)
 SD_LVLS = [.68, .95, .997]
@@ -309,6 +311,10 @@ class OhlcTracker(Observer):
     self.fetched_source = False
     self.fetched_resamples = False
 
+    # Debug / statistics TODO decide whether to keep or discard this mechanic
+    self.iter_lens_parts = []
+    self.iter_lens_fcasts = []
+
   def build(self):
     '''Build original and resampled dataframes. Update on repeated calls. Apply indicators. Insert into database.'''
     with LOCK:
@@ -324,8 +330,14 @@ class OhlcTracker(Observer):
         self.fetched_resamples = True
       logger.info('========== PHASE 2 ===== APPLY & UPSERT')
       self.apsert()
-      logger.info('========== PHASE 3 ===== PREPARE FORECASTS')
+      logger.debug('========== PHASE 3 ===== PREPARE FORECASTS')
       self.prep_forecasts()
+      if len(self.iter_lens_parts):
+        logger.debug('========== PHASE 4 ===== DEBUG STATS')
+        logger.debug(f'Partial avg iter lens  {mean(self.iter_lens_parts)}')
+        logger.debug(f'Partial iter lens len  {len(self.iter_lens_parts)}')
+        logger.debug(f'Forecast avg iter lens {mean(self.iter_lens_fcasts)}')
+        logger.debug(f'Forecast iter lens len {len(self.iter_lens_fcasts)}')
       logger.info(f'========== {action} ENDED')
       return self
 
@@ -391,7 +403,8 @@ class OhlcTracker(Observer):
         # Resample bin into dbin
         if row < len(self.data[bin]):
           logger.info(f'Resampling {bin} data into {dbin} data...')
-          data, self.parts[dbin] = resample(self.data[bin].iloc[row:], bin, dbin)
+          new_rows = self.data[bin].iloc[row:]
+          data, self.parts[dbin] = resample(new_rows, bin, dbin)
           df = pd.concat([df, data], sort=False)
           self.data[dbin] = df
           logger.info(f'{dbin} candles: {len(df)} (+{len(data)})')
@@ -410,7 +423,13 @@ class OhlcTracker(Observer):
         else:
           logger.info(f'No need to resample {bin} data into {dbin} data')
           logger.info(f'{dbin} candles: {len(self.data[dbin])} (+0)')
-          self.parts[dbin] = self.parts[bin]
+          self.parts[dbin] = dict(self.parts[bin]) # create copy
+
+          # [Bug fix] adjust the timestamp
+          t = isoparse(self.parts[bin]['timestamp'])
+          ft = first_timestamp(bin, dbin, t)[0]
+          self.parts[dbin]['timestamp'] = iso_str(ft)
+          logger.debug(f'Set {dbin} timestamp to {ft}')
 
   def fetch_data(self, bin):
     '''Transform dict into pandas DataFrame.'''
@@ -493,18 +512,23 @@ class OhlcTracker(Observer):
       while self.running:
         t0 = time()
         with LOCK:
-          for bin in self.parts:
+          try:
+            for bin in self.parts:
 
-            # Update partial indicators
-            for part_ind in PART_INDS:
-              part_ind(self.data[bin], self.parts[bin])
+              # Update partial indicators
+              for part_ind in PART_INDS:
+                part_ind(self.data[bin], self.parts[bin])
 
-            # Upsert into db
-            if self.insert:
-              upsert_partial(bin)
+              # Upsert into db
+              if self.insert:
+                upsert_partial(bin)
+          except Exception as e:
+            logger.warning(f'Warning: exception in partial loop. {e}')
 
         # Limit iterations
-        logger.debug(f'Partial loop\'s iteration took {time()-t0}')
+        len = time() - t0
+        self.iter_lens_parts.append(len)
+        # logger.debug(f'Partial loop\'s iteration took {time()-t0}')
         sleep(max(PARTIAL_DAEMON_TIMEOUT - time() + t0, 0))
 
     def forecast_loop():
@@ -551,12 +575,14 @@ class OhlcTracker(Observer):
           try:
             for bin in self.data:
               compute_forecast(bin)
-          except ValueError as e:
-            logger.warning(f'Warning: caught ValueError while forecasting: {e}')
+          except Exception as e:
+            logger.warning(f'Warning: exception in forecast loop. {e}')
 
         # Limit iterations
-        logger.debug(f'Forecast loop\'s iteration took {time()-t0}')
-        sleep(max(FORECAST_DAEMON_TIMEOUT - time() + t0, 0))
+        len = time() - t0
+        self.iter_lens_fcasts.append(len)
+        # logger.debug(f'Forecast loop\'s iteration took {len}')
+        sleep(max(FORECAST_DAEMON_TIMEOUT - len, 0))
 
     self.running = True
     start_daemon(target=partial_loop)
