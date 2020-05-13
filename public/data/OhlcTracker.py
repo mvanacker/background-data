@@ -53,7 +53,7 @@ TIMEOUT = 2# seconds, to be safe
 PARTIAL_DAEMON_TIMEOUT = 5# second
 FORECAST_DAEMON_TIMEOUT = 60# second
 LOCK = Lock()
-FORECAST_CUTOFF = 101# amount of rows to consider when applying indicators to
+FORECAST_CUTOFF = 377# amount of rows to consider when applying indicators to
                      # estimated future prices, this value should be greater
                      # than any period of any indicator applied
 
@@ -295,8 +295,7 @@ bs = BlackScholes()
 DEPTH = 6
 ANNUAL = 100
 # ANNUAL_TD = timedelta(days=ANNUAL)
-SD_LVLS = [.68, .95, .997]
-SD_LVLS = [.5 - lvl / 2 for lvl in SD_LVLS]# adjusted for reverse computations
+SD_LVLS = [.5 - lvl / 2 for lvl in [.68, .95, .997]]# adjusted for reverse computations
 TOUCH_LVLS = [lvl / 2 for lvl in SD_LVLS]
 
 class OhlcTracker(Observer):
@@ -471,7 +470,7 @@ class OhlcTracker(Observer):
       t = self.data[bin].index[-1]
       for depth in range(1, 1 + DEPTH):
         self.times[bin].append(next_timestamp(bin, t, depth))
-    clear_forecasts()
+    self.clear_forecasts = True
 
   def update(self, observable, message):
     '''This method is to be called by the socket's message notifier.'''
@@ -532,29 +531,45 @@ class OhlcTracker(Observer):
         sleep(max(PARTIAL_DAEMON_TIMEOUT - time() + t0, 0))
 
     def forecast_loop():
+
+      # Auxiliary lambda
+      ohlc = lambda t, o, h, l, c: {
+        'timestamp': t, 'open': o, 'high': h, 'low': l, 'close': c
+      }
+
       def compute_forecast(bin):
         self.forecasts[bin] = []
-        annualize = lambda dt: dt.total_seconds() / (86400 * ANNUAL)
-        price = self.parts[bin]['close']
-        now = datetime.utcnow().replace(tzinfo=UTC)
-        levels = deque([DEPTH * [price]])
 
-        # Forecast prices at 1st, 2nd and 3rd standard deviation levels
-        for prob in SD_LVLS:
-          lower, upper = list(zip(*[
-            bs.reverse(prob, price, self.volatility, annualize(time - now))
-            for time in self.times[bin]
-          ]))
+        # Compute time remaining to each next tick
+        annualize = lambda dt: dt.total_seconds() / (86400 * ANNUAL)
+        now = datetime.utcnow().replace(tzinfo=UTC)
+        rems = [annualize(time - now) for time in self.times[bin]]
+
+
+        # Forecast the expected candles ("0th standard deviation level")
+        c = self.parts[bin]['close']
+        expected = []
+        for rem, time in zip(rems, self.times[bin]):
+          low, high = bs.reverse(.25, c, self.volatility, rem)
+          expected.append(ohlc(time, c, high, low, c))
+        levels = deque([expected])
+        
+        # Forecast candles at 1st, 2nd and 3rd standard deviation levels
+        for prob, touch_prob in zip(SD_LVLS, TOUCH_LVLS):
+          lower, upper = [], []
+          prev_l, prev_u = c, c
+          for rem, time in zip(rems, self.times[bin]):
+            l_close, u_close = bs.reverse(prob, c, self.volatility, rem)
+            low, high = bs.reverse(touch_prob, c, self.volatility, rem)
+            lower.append(ohlc(time, prev_l, prev_l, low, l_close))
+            upper.append(ohlc(time, prev_u, high, prev_u, u_close))
+            prev_l, prev_u = l_close, u_close
           levels.appendleft(lower)
           levels.append(upper)
 
         # Apply indicators to forecast prices
-        ohlc = lambda t, p: {
-          'timestamp': t, 'open': p, 'high': p, 'low': p, 'close': p
-        }
         for level in levels:
-          rows = [ohlc(t, p) for t, p in zip(self.times[bin], level)]
-          proxy = pd.DataFrame(rows).set_index('timestamp')
+          proxy = pd.DataFrame(level).set_index('timestamp')
 
           # This optimization significantly cuts computation time
           # (-50% at the time)
@@ -572,6 +587,9 @@ class OhlcTracker(Observer):
       while self.running:
         t0 = time()
         with LOCK:
+          if self.clear_forecasts:
+            clear_forecasts()
+            self.clear_forecasts = False
           try:
             for bin in self.data:
               compute_forecast(bin)
