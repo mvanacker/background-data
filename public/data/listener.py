@@ -155,7 +155,7 @@ class VolumeFlowMeasurer(Observer):
               timestamp = parse(datum['timestamp']).replace(tzinfo=None)
             side = datum['side']
             size += datum['size']
-            self.price = datum['price']
+            self.price = round(datum['price'])
             prices.append(self.price)
           price = round(mean(prices), 1)
           trade = {'timestamp': timestamp, 'side': side,
@@ -213,7 +213,7 @@ if __name__ == '__main__':
   # Plug in volume flow measurer and OHLC (+indicators) tracker
   observers = [
     VolumeFlowMeasurer(futures),
-    # OhlcTracker().build(),
+    OhlcTracker().build(),
   ]
   for obs in observers:
     client.websocket.message_notifier.add_observer(obs)
