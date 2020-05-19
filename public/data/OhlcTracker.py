@@ -51,7 +51,7 @@ BINS = ['1h', '1d']
 COUNT = 1000# results to fetch per request (max is 1000)
 TIMEOUT = 2# seconds, to be safe
 PARTIAL_DAEMON_TIMEOUT = 5# second
-FORECAST_DAEMON_TIMEOUT = 60# second
+FORECAST_DAEMON_TIMEOUT = 300# second
 LOCK = Lock()
 FORECAST_CUTOFF = 377# amount of rows to consider when applying indicators to
                      # estimated future prices, this value should be greater
@@ -544,7 +544,6 @@ class OhlcTracker(Observer):
         annualize = lambda dt: dt.total_seconds() / (86400 * ANNUAL)
         now = datetime.utcnow().replace(tzinfo=UTC)
         rems = [annualize(time - now) for time in self.times[bin]]
-
 
         # Forecast the expected candles ("0th standard deviation level")
         c = self.parts[bin]['close']
