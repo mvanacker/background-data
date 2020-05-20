@@ -50,9 +50,6 @@ TIMEOUT = 2# seconds, to be safe
 PARTIAL_DAEMON_TIMEOUT = 5# second
 FORECAST_DAEMON_TIMEOUT = 300# second
 LOCK = Lock()
-FORECAST_CUTOFF = 377# amount of rows to consider when applying indicators to
-                     # estimated future prices, this value should be greater
-                     # than any period of any indicator applied
 
 # Resampled bins (DBINS)
 to_tt = lambda t: t.timetuple()
@@ -294,6 +291,23 @@ ANNUAL = 100
 # corresponding probabilities for reverse computations
 SD_LVLS = [.5 - lvl / 2 for lvl in [.68, .95, .997]]
 TOUCH_LVLS = [lvl / 2 for lvl in SD_LVLS]
+ANNUALIZE = {
+  '1h':  24 * ANNUAL,
+  '2h':  12 * ANNUAL,
+  '3h':  8  * ANNUAL,
+  '4h':  6  * ANNUAL,
+  '6h':  4  * ANNUAL,
+  '12h': 2  * ANNUAL,
+  '1d':       ANNUAL,
+  '2d':       ANNUAL / 2,
+  '3d':       ANNUAL / 3,
+  '1w':       ANNUAL / 7,
+  '1M':       ANNUAL / 30.4167,
+  '3M':       ANNUAL / 91.25,
+}
+# amount of rows to consider when applying indicators to estimated future
+# prices, this value should be greater than any period of any indicator applied
+FORECAST_CUTOFF = 377
 
 class OhlcTracker(Observer):
   '''Tracks historical and partial data.'''
@@ -450,7 +464,6 @@ class OhlcTracker(Observer):
 
   def prep_forecasts(self):
     '''Prepare forecasts by precomputing the volatility and timestamps to feed into the reverse computations. Also clear all forecasts on the data server. That is the easiest way to get rid of the outdated forecasts which wouldn't be overwritten anymore.'''
-    self.volatility = self.data['1d']['hv'][-1] * sqrt(ANNUAL)
     self.times = {}
     for bin in self.data:
       self.times[bin] = []
@@ -529,11 +542,14 @@ class OhlcTracker(Observer):
         now = datetime.utcnow().replace(tzinfo=UTC)
         rems = [annualize(time - now) for time in self.times[bin]]
 
+        # Compute volatility
+        volatility = self.data[bin]['hv'][-1] * sqrt(ANNUALIZE[bin])
+
         # Forecast the expected candles ("0th standard deviation level")
         c = self.parts[bin]['close']
         expected = []
         for rem, time in zip(rems, self.times[bin]):
-          low, high = bs.reverse(.25, c, self.volatility, rem)
+          low, high = bs.reverse(.25, c, volatility, rem)
           expected.append(ohlc(time, c, high, low, c))
         levels = deque([expected])
         
@@ -542,8 +558,8 @@ class OhlcTracker(Observer):
           lower, upper = [], []
           prev_l, prev_u = c, c
           for rem, time in zip(rems, self.times[bin]):
-            l_close, u_close = bs.reverse(prob, c, self.volatility, rem)
-            low, high = bs.reverse(touch_prob, c, self.volatility, rem)
+            l_close, u_close = bs.reverse(prob, c, volatility, rem)
+            low, high = bs.reverse(touch_prob, c, volatility, rem)
             lower.append(ohlc(time, prev_l, prev_l, low, l_close))
             upper.append(ohlc(time, prev_u, high, prev_u, u_close))
             prev_l, prev_u = l_close, u_close
