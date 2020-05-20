@@ -16,9 +16,6 @@ from threading import Lock
 from numpy import mean
 import pandas as pd
 
-# dbg remove
-from threading import Thread
-
 from BitmexClient import BitmexClient
 from Observer import Observer
 from daemon import start_daemon, Starter, Stopper
@@ -294,8 +291,8 @@ PART_INDS = [
 bs = BlackScholes()
 DEPTH = 6
 ANNUAL = 100
-# ANNUAL_TD = timedelta(days=ANNUAL)
-SD_LVLS = [.5 - lvl / 2 for lvl in [.68, .95, .997]]# adjusted for reverse computations
+# corresponding probabilities for reverse computations
+SD_LVLS = [.5 - lvl / 2 for lvl in [.68, .95, .997]]
 TOUCH_LVLS = [lvl / 2 for lvl in SD_LVLS]
 
 class OhlcTracker(Observer):
@@ -309,10 +306,6 @@ class OhlcTracker(Observer):
     self.forecasts = {}
     self.fetched_source = False
     self.fetched_resamples = False
-
-    # Debug / statistics TODO decide whether to keep or discard this mechanic
-    self.iter_lens_parts = []
-    self.iter_lens_fcasts = []
 
   def build(self):
     '''Build original and resampled dataframes. Update on repeated calls. Apply indicators. Insert into database.'''
@@ -331,12 +324,6 @@ class OhlcTracker(Observer):
       self.apsert()
       logger.debug('========== PHASE 3 ===== PREPARE FORECASTS')
       self.prep_forecasts()
-      if len(self.iter_lens_parts):
-        logger.debug('========== PHASE 4 ===== DEBUG STATS')
-        logger.debug(f'Partial avg iter lens  {mean(self.iter_lens_parts)}')
-        logger.debug(f'Partial iter lens len  {len(self.iter_lens_parts)}')
-        logger.debug(f'Forecast avg iter lens {mean(self.iter_lens_fcasts)}')
-        logger.debug(f'Forecast iter lens len {len(self.iter_lens_fcasts)}')
       logger.info(f'========== {action} ENDED')
       return self
 
@@ -525,9 +512,6 @@ class OhlcTracker(Observer):
             logger.warning(f'Warning: exception in partial loop. {e}')
 
         # Limit iterations
-        len = time() - t0
-        self.iter_lens_parts.append(len)
-        # logger.debug(f'Partial loop\'s iteration took {time()-t0}')
         sleep(max(PARTIAL_DAEMON_TIMEOUT - time() + t0, 0))
 
     def forecast_loop():
@@ -596,17 +580,14 @@ class OhlcTracker(Observer):
             logger.warning(f'Warning: exception in forecast loop. {e}')
 
         # Limit iterations
-        len = time() - t0
-        self.iter_lens_fcasts.append(len)
-        # logger.debug(f'Forecast loop\'s iteration took {len}')
-        sleep(max(FORECAST_DAEMON_TIMEOUT - len, 0))
+        sleep(max(FORECAST_DAEMON_TIMEOUT - time() + t0, 0))
 
     self.running = True
     start_daemon(target=partial_loop)
     start_daemon(target=forecast_loop)
 
-DEFAULT_VERBOSITY = logging.INFO
 if __name__ == '__main__':
+  DEFAULT_VERBOSITY = logging.INFO
 
   # Add options
   parser = ArgumentParser()
@@ -657,17 +638,6 @@ if __name__ == '__main__':
   client.websocket.message_notifier.add_observer(ohlct)
   client.websocket.ready_notifier.add_observer(Starter(ohlct))
   client.websocket.close_notifier.add_observer(Stopper(ohlct))
-    
-  # Bit of a hack
-  # class Interrupter(Observer):
-  #   def update(self, o, m):
-  #     def bomb():
-  #       sleep(60)
-  #       client.websocket.auto_reconnect = False
-  #       client.websocket.ws.close()
-  #       ohlct.running = False
-  #     Thread(target=bomb).start()
-  # client.websocket.ready_notifier.add_observer(Interrupter())
 
   if not args.do_not_connect:
     client.connect()
